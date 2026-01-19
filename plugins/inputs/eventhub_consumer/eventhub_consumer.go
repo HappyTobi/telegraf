@@ -4,9 +4,12 @@ package eventhub_consumer
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
+	ioFs "io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -43,6 +46,7 @@ type EventHub struct {
 	ConsumerGroup             string   `toml:"consumer_group"`
 	StorageContainerName      string   `toml:"storage_container_name"`
 	BlobStoreConnectionString string   `toml:"blob_store_connection_string"`
+	PersistenceDir            string   `toml:"persistence_dir"`
 	MessageCount              int      `toml:"message_count"`
 	TimeoutMessageReceiveSec  int      `toml:"timeout_message_receive_sec"`
 	MaxUndeliveredMessages    int      `toml:"max_undelivered_messages"`
@@ -52,10 +56,6 @@ type EventHub struct {
 	Latest                    bool     `toml:"latest"`
 	EnqueuedTimeAsTS          bool     `toml:"enqueued_time_as_ts"`
 	IotHubEnqueuedTimeAsTS    bool     `toml:"iot_hub_enqueued_time_as_ts"`
-
-	//TODO
-	// PersistenceDir         string    `toml:"persistence_dir"` #deprecated
-	// FromTimestamp          time.Time `toml:"from_timestamp"`
 
 	// Metadata
 	ApplicationPropertyFields     []string `toml:"application_property_fields"`
@@ -75,7 +75,7 @@ type EventHub struct {
 
 	// Azure
 	consumerClient  *azeventhubs.ConsumerClient
-	checkpointStore *checkpoints.BlobStore
+	checkpointStore azeventhubs.CheckpointStore
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -106,6 +106,22 @@ func (e *EventHub) Init() (err error) {
 	if e.TimeoutMessageReceiveSec == 0 {
 		e.Log.Debug("timeout message receive sec can not be 0, using default - 60")
 		e.TimeoutMessageReceiveSec = 60
+	}
+
+	// Validate that only one persistence method is used
+	if e.BlobStoreConnectionString != "" && e.PersistenceDir != "" {
+		return fmt.Errorf("blob_store_connection_string and persistence_dir are mutually exclusive, please choose one")
+	}
+
+	if e.PersistenceDir != "" {
+		e.Log.Debugf("Enable eventhub persistance with local dir: %s", e.PersistenceDir)
+
+		checkpointStore, err := NewFileStore(e.PersistenceDir)
+		if err != nil {
+			return fmt.Errorf("error creating file store for checkpointing: %w", err)
+		}
+
+		e.checkpointStore = checkpointStore
 	}
 
 	// Run eventhub consumer with persistence
@@ -171,32 +187,6 @@ func (e *EventHub) Init() (err error) {
 	return err
 }
 
-func (e *EventHub) configureReceivers() (*azeventhubs.ProcessorOptions, *azeventhubs.PartitionClientOptions) {
-	processorOptions := &azeventhubs.ProcessorOptions{}
-	partitionOptions := &azeventhubs.PartitionClientOptions{}
-
-	if e.PrefetchCount != 0 {
-		processorOptions.Prefetch = e.PrefetchCount
-		partitionOptions.Prefetch = e.PrefetchCount
-	}
-
-	if e.Latest {
-		partitionOptions.StartPosition = azeventhubs.StartPosition{
-			Latest: &e.Latest,
-		}
-	}
-
-	return processorOptions, partitionOptions
-}
-
-func fetchEnvironmentVariables() (string, string, string) {
-	namespace := os.Getenv("EVENTHUB_NAMESPACE")
-	name := os.Getenv("EVENTHUB_NAME")
-	connectionString := os.Getenv("EVENTHUB_CONNECTION_STRING")
-
-	return namespace, name, connectionString
-}
-
 func (e *EventHub) Start(acc telegraf.Accumulator) error {
 	e.in = make(chan []telegraf.Metric)
 
@@ -251,6 +241,43 @@ func (e *EventHub) Start(acc telegraf.Accumulator) error {
 	e.wg.Wait()
 
 	return nil
+}
+
+func (e *EventHub) SetParser(parser telegraf.Parser) {
+	e.parser = parser
+}
+
+func (*EventHub) Gather(telegraf.Accumulator) error {
+	return nil
+}
+
+func (e *EventHub) Stop() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+
+	e.consumerClient.Close(ctx)
+	cancel()
+
+	e.cancel()
+	// Wait until all messages are processed
+	e.wg.Wait()
+}
+
+func (e *EventHub) configureReceivers() (*azeventhubs.ProcessorOptions, *azeventhubs.PartitionClientOptions) {
+	processorOptions := &azeventhubs.ProcessorOptions{}
+	partitionOptions := &azeventhubs.PartitionClientOptions{}
+
+	if e.PrefetchCount != 0 {
+		processorOptions.Prefetch = e.PrefetchCount
+		partitionOptions.Prefetch = e.PrefetchCount
+	}
+
+	if e.Latest {
+		partitionOptions.StartPosition = azeventhubs.StartPosition{
+			Latest: &e.Latest,
+		}
+	}
+
+	return processorOptions, partitionOptions
 }
 
 func (e *EventHub) dispatchProcessorClients(ctx context.Context, processor *azeventhubs.Processor) {
@@ -375,25 +402,6 @@ func (e *EventHub) handleProcessorClient(ctx context.Context, pc *azeventhubs.Pr
 	}
 }
 
-func (e *EventHub) SetParser(parser telegraf.Parser) {
-	e.parser = parser
-}
-
-func (*EventHub) Gather(telegraf.Accumulator) error {
-	return nil
-}
-
-func (e *EventHub) Stop() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-
-	e.consumerClient.Close(ctx)
-	cancel()
-
-	e.cancel()
-	// Wait until all messages are processed
-	e.wg.Wait()
-}
-
 // OnMessage handles an Event.  When this function returns without error the
 // Event is immediately accepted and the offset is updated.  If an error is
 // returned the Event is marked for redelivery.
@@ -468,14 +476,6 @@ func (e *EventHub) startTracking(ctx context.Context, ac telegraf.Accumulator) {
 			}
 		}
 	}
-}
-
-func deepCopyMetrics(in []telegraf.Metric) []telegraf.Metric {
-	metrics := make([]telegraf.Metric, 0, len(in))
-	for _, m := range in {
-		metrics = append(metrics, m.Copy())
-	}
-	return metrics
 }
 
 // CreateMetrics returns the Metrics from the Event.
@@ -559,4 +559,139 @@ func init() {
 	inputs.Add("eventhub_consumer", func() telegraf.Input {
 		return &EventHub{}
 	})
+}
+
+func deepCopyMetrics(in []telegraf.Metric) []telegraf.Metric {
+	metrics := make([]telegraf.Metric, 0, len(in))
+	for _, m := range in {
+		metrics = append(metrics, m.Copy())
+	}
+	return metrics
+}
+
+func fetchEnvironmentVariables() (string, string, string) {
+	namespace := os.Getenv("EVENTHUB_NAMESPACE")
+	name := os.Getenv("EVENTHUB_NAME")
+	connectionString := os.Getenv("EVENTHUB_CONNECTION_STRING")
+
+	return namespace, name, connectionString
+}
+
+// Custom FileStore implementation for local file-based checkpointing
+type FileStore struct {
+	// Add necessary fields here
+	persistenceDir string
+}
+
+func NewFileStore(persistenceDir string) (*FileStore, error) {
+	if _, err := os.Stat(persistenceDir); os.IsNotExist(err) {
+		ownershipDir := filepath.Join(persistenceDir, "ownerships")
+		if err := os.MkdirAll(ownershipDir, 0750); err != nil {
+			return nil, fmt.Errorf("error creating persistence/ownerships directory: %w", err)
+		}
+
+		checkpointsDir := filepath.Join(persistenceDir, "checkpoints")
+		if err := os.MkdirAll(checkpointsDir, 0750); err != nil {
+			return nil, fmt.Errorf("error creating persistence/checkpoints directory: %w", err)
+		}
+	}
+
+	return &FileStore{
+		persistenceDir: persistenceDir,
+	}, nil
+}
+
+// Implement necessary methods for FileStore to satisfy the checkpoints.Store interface
+func (fs *FileStore) ClaimOwnership(ctx context.Context, partitionOwnership []azeventhubs.Ownership, options *azeventhubs.ClaimOwnershipOptions) ([]azeventhubs.Ownership, error) {
+	var ownerships []azeventhubs.Ownership
+
+	//loop over all checkpoint files in the persistence dir and create checkpoints.
+	pRootDir := filepath.Join(fs.persistenceDir, "ownerships")
+
+	for _, po := range partitionOwnership {
+		data, err := json.Marshal(po)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling ownership: %w", err)
+		}
+
+		filePath := fmt.Sprintf("%s/ownership_%s_%s_%s_%s.json", pRootDir, po.FullyQualifiedNamespace, po.EventHubName, po.ConsumerGroup, po.PartitionID)
+		if err := os.WriteFile(filePath, data, 0750); err != nil {
+			return nil, fmt.Errorf("error writing ownership file: %w", err)
+		}
+
+		//Just add the unmodified ownership because it's a local store
+		ownerships = append(ownerships, po)
+	}
+
+	return ownerships, nil
+}
+
+func (fs *FileStore) ListCheckpoints(ctx context.Context, fullyQualifiedNamespace string, eventHubName string, consumerGroup string, options *azeventhubs.ListCheckpointsOptions) ([]azeventhubs.Checkpoint, error) {
+	var checkpoints []azeventhubs.Checkpoint
+
+	//loop over all checkpoint files in the persistence dir and create checkpoints.
+	pRootDir := os.DirFS(filepath.Join(fs.persistenceDir, "checkpoints"))
+
+	// get all json files where the checkpoints are stored
+	checkpointFiles, err := ioFs.Glob(pRootDir, "*.json")
+	if err != nil {
+		return nil, fmt.Errorf("error listing checkpoint files: %w", err)
+	}
+
+	for _, cpFile := range checkpointFiles {
+		data, err := os.ReadFile(filepath.Join(fs.persistenceDir, "checkpoints", cpFile))
+		if err != nil {
+			return nil, fmt.Errorf("error reading checkpoint file %s: %w", cpFile, err)
+		}
+
+		loadedCheckpoint := azeventhubs.Checkpoint{}
+		json.Unmarshal(data, &loadedCheckpoint)
+		checkpoints = append(checkpoints, loadedCheckpoint)
+	}
+
+	return checkpoints, nil
+}
+
+func (fs *FileStore) ListOwnership(ctx context.Context, fullyQualifiedNamespace string, eventHubName string, consumerGroup string, options *azeventhubs.ListOwnershipOptions) ([]azeventhubs.Ownership, error) {
+	var ownerships []azeventhubs.Ownership
+
+	ownershipsDir := filepath.Join(fs.persistenceDir, "ownerships")
+	ownershipsDirFs := os.DirFS(ownershipsDir)
+
+	filePattern := fmt.Sprintf("ownership_%s_%s_%s_*.json", fullyQualifiedNamespace, eventHubName, consumerGroup)
+
+	ownershipFiles, err := ioFs.Glob(ownershipsDirFs, filePattern)
+	if err != nil {
+		return nil, fmt.Errorf("error listing ownership files: %w", err)
+	}
+
+	//loop over all ownership files in the persistence dir
+	for _, osFile := range ownershipFiles {
+		data, err := os.ReadFile(filepath.Join(ownershipsDir, osFile))
+		if err != nil {
+			return nil, fmt.Errorf("error reading ownership file %s: %w", osFile, err)
+		}
+
+		loadedOwnership := azeventhubs.Ownership{}
+		json.Unmarshal(data, &loadedOwnership)
+		ownerships = append(ownerships, loadedOwnership)
+	}
+
+	// Implement file-based ownership listing logic here
+	return ownerships, nil
+}
+
+func (fs *FileStore) SetCheckpoint(ctx context.Context, checkpoint azeventhubs.Checkpoint, options *azeventhubs.SetCheckpointOptions) error {
+	//Persist checkpoint struckt as a json file to the persistence dir.
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		return fmt.Errorf("error marshaling checkpoint: %w", err)
+	}
+
+	filePath := fmt.Sprintf("%s/checkpoint_%s_%s_%s.json", filepath.Join(fs.persistenceDir, "checkpoints"), checkpoint.FullyQualifiedNamespace, checkpoint.EventHubName, checkpoint.PartitionID)
+	if err := os.WriteFile(filePath, data, 0750); err != nil {
+		return fmt.Errorf("error writing checkpoint file: %w", err)
+	}
+
+	return nil
 }
